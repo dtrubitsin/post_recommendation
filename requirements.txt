@@ -1,0 +1,8 @@
+numpy==1.26.3
+pandas==2.1.4
+fastapi==0.110.0
+catboost==1.2
+sqlalchemy==2.0.27
+typing==3.7.4.3
+datetime==5.5
+dotenv==0.21.0

@@ -1,0 +1,9 @@
+__init__.py
+__pycache__/
+catboost_info/
+data/
+model/
+.DS_Store
+.env
+db_load.py
+df_vector
