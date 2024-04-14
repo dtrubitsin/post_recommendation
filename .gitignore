@@ -7,3 +7,4 @@ model/
 .env
 db_load.py
 df_vector
+app_copy.py
