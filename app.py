@@ -2,34 +2,62 @@ import os
 import pandas as pd
 
 from fastapi import FastAPI
+
 from typing import List
 from datetime import datetime
-from dotenv import load_dotenv
 from loguru import logger
+import hashlib
 
-from schema import PostGet
+from schema import PostGet, Response
 
 from catboost import CatBoostClassifier
 
-if __name__ == '__main__':
-    load_dotenv()
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 app = FastAPI()
 
+# Константы
+salt = 'get_exp_group'
+num_groups = 2
+
+
+# Разбиение пользователей на группы
+def get_exp_group(user_id: int) -> str:
+    exp_group = int(hashlib.md5((str(user_id) + salt).encode()
+                                ).hexdigest(), 16) % num_groups
+
+    if exp_group == 0:
+        return 'control'
+    else:
+        return 'test'
+
 
 # Путь модели
-def get_model_path(path: str) -> str:
+def get_model_path(model_name: str) -> str:
     if os.environ.get("IS_LMS") == "1":
-        MODEL_PATH = '/workdir/user_input/model'
+        if model_name == 'model_control':
+            MODEL_PATH = '/workdir/user_input/model_control'
+        elif model_name == 'model_test':
+            MODEL_PATH = '/workdir/user_input/model_test'
+        else:
+            raise ValueError('unknown name')
+
     else:
-        MODEL_PATH = path
+        if model_name == 'model_control':
+            MODEL_PATH = '/Users/dmitry/Documents/code/Start_ML/module_2/final_project/model/catboost_ml_1'
+        elif model_name == 'model_test':
+            MODEL_PATH = '/Users/dmitry/Documents/code/Start_ML/module_2/final_project/model/catboost_dl_3'
+        else:
+            raise ValueError('unknown name')
     return MODEL_PATH
 
 
 # Загрузка модели
-def load_models():
-    model_path = get_model_path(
-        "/Users/dmitry/Documents/code/Start_ML/module_2/final_project/model/catboost_1_1")
+def load_models(model_name: str):
+    model_path = get_model_path(model_name)
 
     from_file = CatBoostClassifier()
     model = from_file.load_model(model_path, format='cbm')
@@ -38,12 +66,22 @@ def load_models():
 
 # Основная функция загрузки признаков из БД
 def load_features():
-    # Признаки по постам (созданные)
-    logger.info("loading post feachures")
-    post_feachures = pd.read_sql(
+    # Признаки по постам (созданные) TF-IDF
+    logger.info("loading tf-idf post feachures")
+    post_feachures_control = pd.read_sql(
         """
         SELECT *
         FROM d_trubitsin_post_feachures_base 
+        """,
+        con=os.environ["POSTGRES_CONN"]
+    )
+
+    # Признаки по постам (созданные) DL
+    logger.info("loading dl post feachures")
+    post_feachures_test = pd.read_sql(
+        """
+        SELECT *
+        FROM d_trubitsin_post_feachures_dl 
         """,
         con=os.environ["POSTGRES_CONN"]
     )
@@ -57,40 +95,28 @@ def load_features():
         """,
         con=os.environ["POSTGRES_CONN"]
     )
-    return [post_feachures, user_feachures]
+    return [post_feachures_control, post_feachures_test, user_feachures]
 
 
-logger.info("loading model")
-model = load_models()
-
-logger.info("loading feachures")
-feachures = load_features()
-logger.info("service is up and running")
-
-
-# Эндпоинт для рекомендаций
-@app.get("/post/recommendations/", response_model=List[PostGet])
-def recommended_posts(
-        id: int,
-        time: datetime,
-        limit: int = 5) -> List[PostGet]:
+# Выдача рекомендаций
+def get_recommendations(id, time, limit, model, post_feachures, user_feachures) -> List[PostGet]:
 
     # Признаки пользователя
     logger.info(f"user_id: {id}")
     logger.info("reading feachures")
-    user_feachures = feachures[1].loc[feachures[1]["user_id"] == id].copy()
-    user_feachures.drop('user_id', axis=1, inplace=True)
+    user_feach = user_feachures.loc[user_feachures["user_id"] == id].copy()
+    user_feach.drop(['user_id', 'os', 'source'], axis=1, inplace=True)
 
     # Признаки постов
     logger.info("dropping columns")
-    post_feachures = feachures[0].drop(["index", "text"], axis=1)
-    content = feachures[0][["post_id", "text", "topic"]]
+    post_feach = post_feachures.drop(["index", "text"], axis=1)
+    content = post_feachures[["post_id", "text", "topic"]]
 
     # Объединение признаков
     logger.info("zipping everything")
     add_user_feachures = dict(
-        zip(user_feachures.columns, user_feachures.values[0]))
-    request_data = post_feachures.assign(**add_user_feachures)
+        zip(user_feach.columns, user_feach.values[0]))
+    request_data = post_feach.assign(**add_user_feachures)
     request_data = request_data.set_index('post_id')
 
     # Добавление даты
@@ -110,5 +136,36 @@ def recommended_posts(
         'id': i,
         'text': content[content['post_id'] == i]['text'].values[0],
         'topic': content[content['post_id'] == i]['topic'].values[0]
-    }) for i in recommended_posts
-    ]
+    }) for i in recommended_posts]
+
+
+logger.info("loading model")
+model_control = load_models("model_control")
+model_test = load_models("model_test")
+
+logger.info("loading feachures")
+feachures = load_features()
+logger.info("service is up and running")
+
+
+# Эндпоинт для рекомендаций
+@app.get("/post/recommendations/", response_model=Response)
+def recommended_posts(
+        id: int,
+        time: datetime,
+        limit: int = 5) -> Response:
+    # Отнесение пользователя к группе
+    logger.info('getting exp group')
+    exp_group = get_exp_group(id)
+    logger.info(f"User '{id}' assigned to '{exp_group}'")
+
+    if exp_group == 'control':
+        recommendations = get_recommendations(
+            id, time, limit, model_control, feachures[0], feachures[2])
+    elif exp_group == 'test':
+        recommendations = get_recommendations(
+            id, time, limit, model_test, feachures[1], feachures[2])
+    else:
+        raise ValueError('unknown group')
+
+    return Response(exp_group=exp_group, recommendations=recommendations)
